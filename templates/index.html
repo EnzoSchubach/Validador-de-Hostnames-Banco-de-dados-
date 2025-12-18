@@ -1,0 +1,93 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>Hostname Whitelist Checker</title>
+    <style>
+        body {
+            font-family: sans-serif;
+            max-width: 600px;
+            margin: 2rem auto;
+        }
+
+        .card {
+            border: 1px solid #ccc;
+            padding: 1rem 1.5rem;
+            border-radius: 4px;
+        }
+
+        .result-ok {
+            color: green;
+        }
+
+        .result-bad {
+            color: red;
+        }
+
+        .result-invalid {
+            color: #aa6600;
+        }
+
+        ul {
+            padding-left: 1.2rem;
+        }
+    </style>
+</head>
+<body>
+    <h1>Hostname Whitelist Checker</h1>
+    <p>
+        Enter a hostname like <code>foo.example.com</code> or a wildcard like
+        <code>*.example.com</code>.
+    </p>
+
+    <div class="card">
+        <form method="post" action="/">
+            <label for="hostname">Hostname or wildcard:</label><br>
+            <input
+                type="text"
+                id="hostname"
+                name="hostname"
+                value="{{ hostname | e }}"
+                style="width: 100%; padding: 0.4rem; margin-top: 0.3rem;"
+                placeholder="example.com or *.example.com"
+            >
+            <br><br>
+            <button type="submit">Check</button>
+        </form>
+    </div>
+
+    {% if result %}
+        <h2>Result</h2>
+        <div class="card">
+            {% if result.mode == "invalid" %}
+                <p class="result-invalid">
+                    Invalid input: {{ result.reason }}
+                </p>
+            {% elif result.allowed %}
+                <p class="result-ok">
+                    ✅ Allowed ({{ result.mode }} match)
+                </p>
+                <p>{{ result.reason }}</p>
+            {% else %}
+                <p class="result-bad">
+                    ❌ Not allowed ({{ result.mode }} lookup)
+                </p>
+                <p>{{ result.reason }}</p>
+            {% endif %}
+
+            {% if result.matches %}
+                <p>Matched hostnames (up to 20):</p>
+                <ul>
+                    {% for h in result.matches %}
+                        <li>{{ h }}</li>
+                    {% endfor %}
+                </ul>
+            {% endif %}
+
+            <p>
+                Match count: {{ result.match_count }}
+            </p>
+        </div>
+    {% endif %}
+</body>
+</html>
