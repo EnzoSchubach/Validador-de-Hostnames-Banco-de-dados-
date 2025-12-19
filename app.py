@@ -1,111 +1,89 @@
-from flask import Flask, render_template, request, jsonify
+import psycopg2 # Certifique-se que este import está no topo do app.py
+from fastapi import FastAPI, BackgroundTasks
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
 import os
 
-from DAL.whitelist_db import WhitelistDB, DB_PATH
+from DAL.whitelist_db import WhitelistDB
+from cache_manager import cache_duo
+from workers import executar_probe_assincrono
 
-app = Flask(__name__)
+app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 db = WhitelistDB()
 
+@app.get("/")
+async def read_index():
+    return FileResponse('templates/index.html')
 
-def check_hostname_in_whitelist(host_query: str):
-    """
-    Business logic only:
-    - Normalization and validation
-    - Deciding between exact vs wildcard
-    - Building the response dict
-    """
+@app.post("/api/v1/check")
+async def check_hostnames(hostnames: list[str], background_tasks: BackgroundTasks):
+    respostas = []
+    for host in hostnames:
+        hit = cache_duo.obter(host)
+        if hit:
+            respostas.append({"hostname": host, "status": hit, "reason": "Cache L1"})
+            continue
 
-    host_query = host_query.strip().lower()
-
-    if not host_query:
-        return {
-            "allowed": False,
-            "mode": "invalid",
-            "match_count": 0,
-            "matches": [],
-            "reason": "Empty hostname",
-        }
-
-    allowed_chars = set("abcdefghijklmnopqrstuvwxyz0123456789.-*")
-    if any(c not in allowed_chars for c in host_query):
-        return {
-            "allowed": False,
-            "mode": "invalid",
-            "match_count": 0,
-            "matches": [],
-            "reason": "Hostname has invalid characters",
-        }
-
-    # Wildcard mode like *.example.com
-    if host_query.startswith("*.") and len(host_query) > 2:
-        domain = host_query[2:]
-
-        matches = db.suffix_matches(domain, limit=20)
-        match_count = len(matches)
-
-        return {
-            "allowed": match_count > 0,
-            "mode": "wildcard",
-            "match_count": match_count,
-            "matches": matches,
-            "reason": "Found hosts with that suffix" if matches else "No hosts match this wildcard",
-        }
-
-    # Exact match mode
-    matches = db.exact_matches(host_query)
-    match_count = len(matches)
-
-    return {
-        "allowed": match_count > 0,
-        "mode": "exact",
-        "match_count": match_count,
-        "matches": matches,
-        "reason": "Exact hostname found in whitelist" if matches else "Hostname not present in whitelist",
-    }
-
-
-@app.route("/", methods=["GET", "POST"])
-def index():
-    result = None
-    hostname = ""
-
-    if request.method == "POST":
-        hostname = request.form.get("hostname", "")
-        result = check_hostname_in_whitelist(hostname)
-
-    return render_template("index.html", hostname=hostname, result=result)
-
-
-@app.route("/api/check", methods=["GET", "POST"])
-def api_check():
-    """
-    Simple JSON API for hostname checks.
-
-    Usage examples:
-      - GET  /api/check?hostname=example.com
-      - POST /api/check with form-data or JSON: {"hostname": "example.com"}
-    """
-    hostname = ""
-
-    if request.method == "GET":
-        hostname = request.args.get("hostname", "")
-    else:  # POST
-        if request.is_json:
-            data = request.get_json(silent=True) or {}
-            hostname = data.get("hostname", "")
+        res_db = db.check_hostname(host)
+        
+        if res_db["allowed"]:
+            background_tasks.add_task(executar_probe_assincrono, host)
+            status = "VALID"
         else:
-            hostname = request.form.get("hostname", "")
+            status = "DISALLOWED"
+            
+        respostas.append({
+            "hostname": host,
+            "status": status,
+            "reason": res_db["reason"]
+        })
+    return respostas
 
-    result = check_hostname_in_whitelist(hostname)
-    # You could wrap with extra fields if you like, e.g. {"hostname": hostname, "result": result}
-    return jsonify(result)
 
 
-if __name__ == "__main__":
-    # Simple guard to make sure DB exists
-    if not os.path.exists(DB_PATH):
-        print("Database file does not exist yet.")
-        print("Run `python load_hostnames.py` first to create and populate it.")
-    app.run(debug=True)
-
+@app.get("/api/v1/history")
+async def get_history():
+    conn = None
+    try:
+        # Conexão idêntica ao que você testou no terminal agora
+        conn = psycopg2.connect(
+            dbname="validador_hostnames",
+            user="postgres",
+            password="postgres", # <--- COLOQUE A SENHA AQUI
+            host="localhost",
+            port="5432"
+        )
+        
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT hostname, status, latency_ms, resolved_ips, checked_at 
+                FROM probe_history 
+                ORDER BY checked_at DESC 
+                LIMIT 10
+            """)
+            rows = cur.fetchall()
+        
+        history = []
+        for row in rows:
+            history.append({
+                "hostname": row[0],
+                "status": row[1],
+                "latency_ms": row[2],
+                "resolved_ips": row[3],
+                "checked_at": row[4].isoformat() if row[4] else None
+            })
+        return history
+    except Exception as e:
+        print(f"Erro ao buscar histórico: {e}")
+        return []
+    finally:
+        if conn:
+            conn.close()

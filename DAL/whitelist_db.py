@@ -1,7 +1,7 @@
 import psycopg2
 from typing import List, Optional
 
-# Configurações de conexão (devem ser as mesmas do load_hostnames.py)
+# Mesma configuração do load_hostnames.py
 DB_CONFIG = {
     "host": "localhost",
     "database": "validador_hostnames",
@@ -13,56 +13,68 @@ class WhitelistDB:
     def __init__(self):
         self.config = DB_CONFIG
 
-    def _execute_query(self, sql: str, params: tuple):
-        """Método auxiliar para gerenciar conexões com o Postgres."""
-        conn = psycopg2.connect(**self.config)
-        try:
-            with conn.cursor() as cur:
-                cur.execute(sql, params)
-                return cur.fetchall()
-        finally:
-            conn.close()
-
     def check_hostname(self, hostname: str) -> dict:
         """
-        Verifica se um hostname é permitido.
-        Implementa lógica de match exato e wildcard (Nível 4).
+        Verifica se um hostname é permitido (Busca Otimizada B-Tree).
+        Suporta múltiplos níveis de wildcard (Recursividade).
         """
         hostname = hostname.strip().lower()
         
-        # 1. Tenta Match Exato
-        # Busca por registros onde is_wildcard é Falso
-        exact_query = "SELECT hostname FROM allowed_hosts WHERE hostname = %s AND is_wildcard = FALSE LIMIT 1"
-        res = self._execute_query(exact_query, (hostname,))
-        
-        if res:
-            return {"allowed": True, "type": "exact", "match": res[0][0]}
+        conn = psycopg2.connect(**self.config)
+        try:
+            with conn.cursor() as cur:
+                # 1. Tenta Match Exato (is_wildcard = FALSE)
+                cur.execute(
+                    "SELECT hostname FROM allowed_hosts WHERE hostname = %s AND is_wildcard = FALSE", 
+                    (hostname,)
+                )
+                res = cur.fetchone()
+                if res:
+                    return {"allowed": True, "type": "exact", "match": res[0], "reason": "Match exato na whitelist"}
 
-        # 2. Tenta Match de Wildcard (Domínio Pai)
-        # Se recebemos 'app.google.com', testamos se existe 'google.com' com is_wildcard = True
-        parts = hostname.split('.')
-        if len(parts) > 1:
-            parent_domain = ".".join(parts[1:])
-            wildcard_query = "SELECT hostname FROM allowed_hosts WHERE hostname = %s AND is_wildcard = TRUE LIMIT 1"
-            res = self._execute_query(wildcard_query, (parent_domain,))
-            
-            if res:
-                return {"allowed": True, "type": "wildcard", "match": f"*.{res[0][0]}"}
+                # 2. Tenta Match de Wildcard Recursivo (Subindo os níveis)
+                # Ex: a.b.google.com -> tenta b.google.com -> tenta google.com
+                parts = hostname.split('.')
+                while len(parts) > 1:
+                    parts.pop(0) # Remove a subparte mais à esquerda
+                    parent_domain = ".".join(parts)
+                    
+                    cur.execute(
+                        "SELECT hostname FROM allowed_hosts WHERE hostname = %s AND is_wildcard = TRUE", 
+                        (parent_domain,)
+                    )
+                    res_w = cur.fetchone()
+                    if res_w:
+                        return {
+                            "allowed": True, 
+                            "type": "wildcard", 
+                            "match": f"*.{res_w[0]}",
+                            "reason": f"Permitido via regra wildcard de {res_w[0]}"
+                        }
 
-        return {"allowed": False, "type": None, "match": None}
+        except Exception as e:
+            print(f"❌ Erro na consulta ao banco: {e}")
+        finally:
+            conn.close()
 
-    def save_probe_history(self, hostname: str, status: str, latency: int, ips: List[str]):
+        return {"allowed": False, "type": None, "match": None, "reason": "Não encontrado na whitelist"}
+
+    def save_probe_history(self, hostname: str, status: str, latency: float, ips: List[str], reason: str = ""):
         """
-        Salva o resultado do probe na tabela separada de histórico (Requisito 5.2).
+        Salva o histórico de checks (Requisito 5.2).
+        ips: lista de strings (ex: ['1.1.1.1', '8.8.8.8'])
         """
         sql = """
-            INSERT INTO probe_history (hostname, status, latency_ms, resolved_ips)
-            VALUES (%s, %s, %s, %s)
+            INSERT INTO probe_history (hostname, status, latency_ms, resolved_ips, reason)
+            VALUES (%s, %s, %s, %s, %s)
         """
         conn = psycopg2.connect(**self.config)
         try:
             with conn.cursor() as cur:
-                cur.execute(sql, (hostname, status, latency, ips))
+                # O psycopg2 converte a lista 'ips' automaticamente para o formato ARRAY do Postgres
+                cur.execute(sql, (hostname, status, latency, ips, reason))
                 conn.commit()
+        except Exception as e:
+            print(f"❌ Erro ao salvar histórico: {e}")
         finally:
             conn.close()
